@@ -1,0 +1,1830 @@
+# ========== 前置：屏蔽人脸识别相关弃用警告 ==========
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning, module="insightface")
+warnings.filterwarnings("ignore", category=FutureWarning, module="skimage")
+
+import tkinter as tk
+from tkinter import filedialog, messagebox, scrolledtext, ttk
+import os
+import sys
+import io
+import zlib
+import re
+import hashlib
+import hmac
+import struct
+import tempfile
+import zipfile
+import traceback
+import numpy as np
+from PIL import Image, ImageDraw, ImageTk
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import pad, unpad
+from Crypto.Random import get_random_bytes
+import pickle
+import time
+from scipy.spatial.distance import cdist
+from scipy.interpolate import interp1d
+import tkinterdnd2  # 拖拽核心库
+import base64
+import json
+import threading
+import cv2
+from insightface.app import FaceAnalysis
+import onnxruntime as ort
+import librosa
+import sounddevice as sd
+import soundfile as sf
+
+from resemblyzer import VoiceEncoder, preprocess_wav
+
+# ========== 全局输出静默与弹窗化 ==========
+
+class _MessageBoxStderr:
+    """重定向 stderr，将严重错误信息收集到缓冲区，不打印到控制台"""
+    def __init__(self):
+        self.buffer = io.StringIO()
+        self.full_log = []  # 完整日志
+
+    def write(self, s):
+        self.buffer.write(s)
+        self.full_log.append(s)
+        if "Error" in s or "Traceback" in s:
+            try:
+                root = None
+                for w in tk._default_root.winfo_children() if hasattr(tk, '_default_root') else []:
+                    root = w.winfo_toplevel()
+                    break
+                if root and root.winfo_exists():
+                    root.after(100, self._show_error, s)
+            except:
+                pass
+
+    def _show_error(self, msg):
+        if msg.strip():
+            messagebox.showwarning("控制台错误", msg[:500])
+
+    def flush(self):
+        pass
+
+    def getvalue(self):
+        return self.buffer.getvalue()
+
+# 注意：sys.excepthook 的全局设置已移至主程序块内，避免在导入模块时影响其他程序
+# 在此仅重定向 stderr
+sys.stderr = _MessageBoxStderr()
+
+# ====================== 核心常量定义 ======================
+# 加密常量
+AES_KEY_LENGTH = 32          # 256位AES密钥
+GCM_NONCE_LENGTH = 12        # GCM推荐nonce长度
+KDF_ITERATIONS = 310000      # NIST推荐迭代次数
+KDF_HASH_ALG = 'sha256'
+SIGNATURE_HASH_ALG = 'sha3-256'
+ENCRYPTION_MAGIC = b'guifeiCRYPT11'   # 魔数
+VERSION = b'1.0'             # 版本号
+HMAC_LENGTH = 32             # SHA3-256 HMAC长度
+SALT_LENGTH = 16             # 盐长度
+
+# 文件类型标识
+FILE_TYPE_TEXT = b'msc'       # 文本文档
+FILE_TYPE_FILE = b'guifei'    # 单文件
+FILE_TYPE_FOLDER = b'guifeinext' # 文件夹
+GRID_SIGNATURE_MATCH_REQUIRED = True
+
+# 4×4宫格常量
+GRID_SIZE = 4
+GRID_POINT_SIZE = 30
+GRID_SPACING = 10
+
+# 人脸识别常量
+FACE_SIMILARITY_THRESHOLD = 0.75
+FACE_MODEL_NAME = "buffalo_l"
+FACE_PREVIEW_SIZE = (480, 360)
+
+# 声纹识别常量
+VOICE_SAMPLE_RATE = 16000
+VOICE_DURATION = 3
+VOICE_EMBEDDING_THRESHOLD = 0.75
+
+# 宫格外层加密标志字节
+GRID_FLAG_BYTE = b'\x01'
+NO_GRID_FLAG_BYTE = b'\x00'
+
+# ====================== 核心组件 ======================
+class LoadingWindow(tk.Toplevel):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("加载中")
+        self.geometry("320x100")
+        self.configure(bg="#f0f0f0")
+        self.attributes('-alpha', 0.8)
+        self.attributes('-topmost', True)
+        self.transient(parent)
+        self.grab_set()
+
+        self.update_idletasks()
+        x = (self.winfo_screenwidth() // 2) - (300 // 2)
+        y = (self.winfo_screenheight() // 2) - (100 // 2)
+        self.geometry(f"300x100+{x}+{y}")
+
+        tk.Label(self, text="GuìFē! :)防破密专家努力加载中...", bg="#f0f0f0", font=("微软雅黑", 12)).pack(pady=20)
+        self.progress = ttk.Progressbar(self, mode='indeterminate')
+        self.progress.pack(fill=tk.X, padx=20, pady=10)
+        self.progress.start(20)
+
+class PasswordDialog(tk.Toplevel):
+    def __init__(self, parent, title, prompt, show_strength=True):
+        super().__init__(parent)
+        self.title(title)
+        self.geometry("400x200")
+        self.parent = parent
+        self.result = None
+        self.show_strength = show_strength
+
+        self.configure(bg="#e0e0e0")
+        self.attributes('-alpha', 0.9)
+        self.attributes('-topmost', True)
+        self.transient(parent)
+        self.grab_set()
+
+        self.update_idletasks()
+        x = (parent.winfo_screenwidth() // 2) - (400 // 2)
+        y = (parent.winfo_screenheight() // 2) - (200 // 2)
+        self.geometry(f"400x200+{x}+{y}")
+
+        tk.Label(self, text=prompt, font=("微软雅黑", 11), bg="#e0e0e0").pack(pady=15)
+
+        self.password_var = tk.StringVar()
+        self.password_var.trace_add("write", self.update_strength)
+
+        self.password_entry = tk.Entry(self, textvariable=self.password_var, show="*",
+                                       font=("微软雅黑", 12), bg="#f5f5f5", relief=tk.FLAT, bd=1)
+        self.password_entry.pack(pady=5, padx=20, fill=tk.X)
+
+        if show_strength:
+            self.strength_frame = tk.Frame(self, height=10, bg="#f5f5f5")
+            self.strength_frame.pack(pady=5, padx=20, fill=tk.X)
+            self.strength_label = tk.Label(self, text="密码强度: 无", font=("微软雅黑", 9), bg="#e0e0e0")
+            self.strength_label.pack(pady=2)
+
+        btn_frame = tk.Frame(self, bg="#e0e0e0")
+        btn_frame.pack(pady=15)
+
+        tk.Button(btn_frame, text="确定", command=self.ok, width=10,
+                  bg="#999999", fg="white", relief=tk.FLAT, activebackground="#777777").pack(side=tk.LEFT, padx=10)
+        tk.Button(btn_frame, text="取消", command=self.cancel, width=10,
+                  bg="#999999", fg="white", relief=tk.FLAT, activebackground="#777777").pack(side=tk.LEFT)
+
+        self.password_entry.focus_set()
+
+    def calculate_strength(self, password):
+        score = 0
+        length = len(password)
+        if length >= 8: score += 20
+        if length >= 12: score += 10
+        if length >= 16: score += 10
+        if length >= 20: score += 10
+        if re.search(r'[A-Z]', password): score += 15
+        if re.search(r'[a-z]', password): score += 15
+        if re.search(r'[0-9]', password): score += 15
+        if re.search(r'[^A-Za-z0-9]', password): score += 15
+        common_passwords = {"12345678", "password", "01234567", "1234567890", "abcd1234", "11111111"}
+        if password.lower() in common_passwords:
+            score = max(0, score - 30)
+        return min(score, 100)
+
+    def update_strength(self, *args):
+        if not self.show_strength: return
+        password = self.password_var.get()
+        strength = self.calculate_strength(password)
+        for widget in self.strength_frame.winfo_children():
+            widget.destroy()
+        color = "#ff4444" if strength < 30 else "#ffaa00" if strength < 60 else "#aacc00" if strength < 80 else "#44dd00"
+        bar = tk.Frame(self.strength_frame, bg=color, width=int(strength * 4), height=10)
+        bar.pack(side=tk.LEFT, fill=tk.Y)
+        strength_text = "弱" if strength < 30 else "中" if strength < 60 else "强" if strength < 80 else "极强"
+        self.strength_label.config(text=f"密码强度: {strength_text} ({strength}%)")
+
+    def ok(self):
+        password = self.password_var.get()
+        if not password:
+            messagebox.showwarning("警告", "密码不能为空！", parent=self)
+            return
+        self.result = password
+        self.destroy()
+
+    def cancel(self):
+        self.result = None
+        self.destroy()
+
+    def show(self):
+        self.wait_window()
+        return self.result
+
+class GridSignaturePad(tk.Toplevel):
+    def __init__(self, parent, title="宫格加密", existing_signature=None):
+        super().__init__(parent)
+        self.title(title)
+        self.geometry("400x450")
+        self.parent = parent
+        self.result = None
+        self.existing_signature = existing_signature
+        self.is_verified = False
+
+        self.configure(bg="#e0e0e0")
+        self.attributes('-alpha', 0.9)
+        self.attributes('-topmost', True)
+        self.transient(parent)
+        self.grab_set()
+
+        self.update_idletasks()
+        x = (parent.winfo_screenwidth() // 2) - (400 // 2)
+        y = (parent.winfo_screenheight() // 2) - (450 // 2)
+        self.geometry(f"400x450+{x}+{y}")
+
+        self.selected_points = []
+        self.grid_canvas = None
+        self.point_positions = {}
+        self.setup_ui()
+
+    def setup_ui(self):
+        prompt_text = "请按顺序点击宫格点完成连接（至少选择4格）"
+        if self.existing_signature:
+            prompt_text = "请按之前顺序点击宫格点完成验证"
+        tk.Label(self, text=prompt_text, font=("微软雅黑", 10), bg="#e0e0e0").pack(pady=10)
+
+        canvas_width = GRID_SIZE * (GRID_POINT_SIZE + GRID_SPACING) + GRID_SPACING
+        canvas_height = canvas_width
+        self.grid_canvas = tk.Canvas(self, width=canvas_width, height=canvas_height,
+                                     bg="white", bd=1, relief=tk.SOLID)
+        self.grid_canvas.pack(pady=10)
+        self.draw_grid()
+        self.grid_canvas.bind("<Button-1>", self.on_point_click)
+
+        btn_frame = tk.Frame(self, bg="#e0e0e0")
+        btn_frame.pack(pady=20)
+
+        tk.Button(btn_frame, text="清除", command=self.clear, width=10,
+                  bg="#999999", fg="white", relief=tk.FLAT, activebackground="#777777").pack(side=tk.LEFT, padx=10)
+        tk.Button(btn_frame, text="确定", command=self.ok, width=10,
+                  bg="#44dd00", fg="white", relief=tk.FLAT, activebackground="#33bb00").pack(side=tk.LEFT, padx=10)
+        tk.Button(btn_frame, text="取消", command=self.cancel, width=10,
+                  bg="#ff4444", fg="white", relief=tk.FLAT, activebackground="#dd2222").pack(side=tk.LEFT, padx=10)
+
+        self.point_label = tk.Label(self, text="已选点：无", font=("微软雅黑", 9), bg="#e0e0e0")
+        self.point_label.pack(pady=5)
+
+    def draw_grid(self):
+        self.grid_canvas.delete("all")
+        self.point_positions.clear()
+        start_x = GRID_SPACING + GRID_POINT_SIZE // 2
+        start_y = GRID_SPACING + GRID_POINT_SIZE // 2
+        for row in range(GRID_SIZE):
+            for col in range(GRID_SIZE):
+                x = start_x + col * (GRID_POINT_SIZE + GRID_SPACING)
+                y = start_y + row * (GRID_POINT_SIZE + GRID_SPACING)
+                self.grid_canvas.create_oval(
+                    x - GRID_POINT_SIZE//2, y - GRID_POINT_SIZE//2,
+                    x + GRID_POINT_SIZE//2, y + GRID_POINT_SIZE//2,
+                    fill="#cccccc", outline="#666666", width=2,
+                    tags=(f"point_{row}_{col}", "grid_point")
+                )
+                self.grid_canvas.create_text(
+                    x, y, text=f"{row+1},{col+1}", fill="#666666", font=("微软雅黑", 8),
+                    tags=(f"coord_{row}_{col}", "point_coord")
+                )
+                self.point_positions[(row, col)] = (x, y)
+        self.draw_connections()
+
+    def draw_connections(self):
+        if len(self.selected_points) < 2:
+            return
+        for i in range(1, len(self.selected_points)):
+            prev_point = self.selected_points[i-1]
+            curr_point = self.selected_points[i]
+            x1, y1 = self.point_positions[prev_point]
+            x2, y2 = self.point_positions[curr_point]
+            self.grid_canvas.create_line(
+                x1, y1, x2, y2,
+                fill="#44dd00", width=3, tags="connection_line"
+            )
+        for idx, (row, col) in enumerate(self.selected_points):
+            x, y = self.point_positions[(row, col)]
+            self.grid_canvas.create_oval(
+                x - GRID_POINT_SIZE//2, y - GRID_POINT_SIZE//2,
+                x + GRID_POINT_SIZE//2, y + GRID_POINT_SIZE//2,
+                fill="#44dd00", outline="#22bb00", width=2,
+                tags=(f"selected_{row}_{col}", "selected_point")
+            )
+            self.grid_canvas.create_text(
+                x, y, text=str(idx+1), fill="white", font=("微软雅黑", 10, "bold"),
+                tags=(f"num_{row}_{col}", "point_number")
+            )
+
+    def on_point_click(self, event):
+        click_x, click_y = event.x, event.y
+        selected_point = None
+        for (row, col), (x, y) in self.point_positions.items():
+            if (click_x - x)**2 + (click_y - y)**2 <= (GRID_POINT_SIZE//2)**2:
+                selected_point = (row, col)
+                break
+        if selected_point:
+            if len(self.selected_points) == 0 or self.selected_points[-1] != selected_point:
+                self.selected_points.append(selected_point)
+                self.draw_grid()
+                self.update_point_label()
+
+    def update_point_label(self):
+        if not self.selected_points:
+            self.point_label.config(text="已选点：无")
+        else:
+            point_list = [f"({r+1},{c+1})" for r, c in self.selected_points]
+            point_text = "已选点：" + "+".join(point_list)
+            self.point_label.config(text=point_text)
+
+    def clear(self):
+        self.selected_points = []
+        self.draw_grid()
+        self.update_point_label()
+
+    def get_signature_string(self):
+        point_list = [f"({r+1},{c+1})" for r, c in self.selected_points]
+        return "+".join(point_list)
+
+    def parse_signature_string(self, signature_str):
+        if not signature_str:
+            return []
+        pattern = r'\((\d+),(\d+)\)'
+        matches = re.findall(pattern, signature_str)
+        points = []
+        for row_str, col_str in matches:
+            row = int(row_str) - 1
+            col = int(col_str) - 1
+            if 0 <= row < GRID_SIZE and 0 <= col < GRID_SIZE:
+                points.append((row, col))
+        return points
+
+    def get_signature_data(self):
+        signature_str = self.get_signature_string()
+        signature_data = {
+            'version': '1.0',
+            'grid_size': GRID_SIZE,
+            'signature_string': signature_str,
+            'point_sequence': self.selected_points,
+            'sequence_length': len(self.selected_points),
+            'created_at': time.time()
+        }
+        signature_data['hash'] = hashlib.sha256(signature_str.encode()).hexdigest()
+        return signature_data
+
+    def verify_signature(self):
+        if not self.existing_signature or not self.selected_points:
+            return False
+        ref_signature_str = self.existing_signature.get('signature_string', '')
+        ref_points = self.parse_signature_string(ref_signature_str)
+        return self.selected_points == ref_points
+
+    def ok(self):
+        if len(self.selected_points) < 4:
+            messagebox.showwarning("警告", "至少需要选择4个点完成连接！", parent=self)
+            return
+        if self.existing_signature:
+            self.is_verified = self.verify_signature()
+            if not self.is_verified:
+                messagebox.showerror("错误", "宫格连接顺序不匹配，验证失败！", parent=self)
+                self.clear()
+                return
+        self.result = self.get_signature_data()
+        self.destroy()
+
+    def cancel(self):
+        self.result = None
+        self.destroy()
+
+    def show(self):
+        self.wait_window()
+        return self.result, self.is_verified
+
+# ====================== 人脸识别核心组件 ======================
+class FaceAuthManager:
+    _instance = None
+    _face_app = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def load_model(self):
+        if self._face_app is not None:
+            return True
+
+        # 保存原始 stdout/stderr 以便恢复
+        original_stdout = sys.stdout
+        original_stderr = sys.stderr
+        sys.stdout = io.StringIO()
+        sys.stderr = io.StringIO()
+
+        try:
+            available_providers = ort.get_available_providers()
+            if 'DmlExecutionProvider' not in available_providers:
+                raise RuntimeError(
+                    "未检测到可用的GPU加速环境（DirectML）\n"
+                    "请检查：\n"
+                    "1. 显卡驱动是否为最新版本\n"
+                    "2. 显卡是否支持 DirectX 12"
+                )
+
+            providers = ['DmlExecutionProvider']
+            self._face_app = FaceAnalysis(name=FACE_MODEL_NAME, providers=providers)
+            self._face_app.prepare(ctx_id=0, det_size=(640, 640))
+
+            rec_model = self._face_app.models['recognition']
+            actual_providers = rec_model.session.get_providers()
+            if 'DmlExecutionProvider' not in actual_providers:
+                raise RuntimeError("GPU加速启动失败，已禁止CPU回退，请检查显卡硬件环境")
+
+            return True
+        except Exception as e:
+            raise Exception(f"人脸模型加载失败：{str(e)}")
+        finally:
+            # 恢复原始 stdout/stderr
+            sys.stdout = original_stdout
+            sys.stderr = original_stderr
+
+    def extract_feature(self, frame):
+        faces = self._face_app.get(frame)
+        if len(faces) == 0:
+            return None
+        best_face = max(faces, key=lambda f: f.det_score)
+        return best_face.embedding.copy()
+
+    @staticmethod
+    def calc_similarity(feat1, feat2):
+        return np.dot(feat1, feat2) / (np.linalg.norm(feat1) * np.linalg.norm(feat2))
+
+class FaceAuthDialog(tk.Toplevel):
+    def __init__(self, parent, mode="collect", reference_features=None, title="人脸验证"):
+        super().__init__(parent)
+        self.title(title)
+        self.geometry("520x520")
+        self.parent = parent
+        self.mode = mode
+        self.reference_features = reference_features
+        self.result = None
+        self.is_verified = False
+        self.running = True
+        self.current_frame = None
+        self.collected_features = []
+        self.capture_count = 0
+
+        self.configure(bg="#e0e0e0")
+        self.attributes('-alpha', 0.9)
+        self.attributes('-topmost', True)
+        self.transient(parent)
+        self.grab_set()
+
+        self.update_idletasks()
+        x = (parent.winfo_screenwidth() // 2) - (520 // 2)
+        y = (parent.winfo_screenheight() // 2) - (520 // 2)
+        self.geometry(f"520x520+{x}+{y}")
+
+        self.setup_ui()
+        self.init_camera_and_model()
+
+    def setup_ui(self):
+        prompt = "请正对摄像头，点击按钮采集第1张人脸（共3张）" if self.mode == "collect" else "请正对摄像头，点击按钮完成人脸验证"
+        self.status_label = tk.Label(self, text=prompt, font=("微软雅黑", 11), bg="#e0e0e0")
+        self.status_label.pack(pady=10)
+
+        self.preview_label = tk.Label(self, bd=2, relief=tk.SUNKEN, bg="black")
+        self.preview_label.pack(pady=5)
+
+        self.result_label = tk.Label(self, text="", font=("微软雅黑", 10), bg="#e0e0e0", fg="#333")
+        self.result_label.pack(pady=5)
+
+        btn_frame = tk.Frame(self, bg="#e0e0e0")
+        btn_frame.pack(pady=15)
+
+        self.capture_btn = tk.Button(
+            btn_frame, text="拍照采集", command=self.on_capture, width=12,
+            bg="#44dd00", fg="white", relief=tk.FLAT, activebackground="#33bb00",
+            state=tk.DISABLED
+        )
+        self.capture_btn.pack(side=tk.LEFT, padx=10)
+
+        tk.Button(
+            btn_frame, text="取消", command=self.cancel, width=10,
+            bg="#ff4444", fg="white", relief=tk.FLAT, activebackground="#dd2222"
+        ).pack(side=tk.LEFT, padx=10)
+
+    def init_camera_and_model(self):
+        def task():
+            try:
+                manager = FaceAuthManager()
+                manager.load_model()
+                # 打开摄像头，Windows下使用CAP_DSHOW，其他平台使用默认
+                if sys.platform == "win32":
+                    self.cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+                else:
+                    self.cap = cv2.VideoCapture(0)
+                if not self.cap.isOpened():
+                    raise Exception("无法打开摄像头，请检查设备是否被占用")
+
+                self.after(0, lambda: (
+                    self.capture_btn.config(state=tk.NORMAL),
+                    self.update_preview()
+                ))
+            except Exception as e:
+                self.after(0, lambda e=e: (
+                    messagebox.showerror("错误", str(e), parent=self),
+                    self.destroy()
+                ))
+        threading.Thread(target=task, daemon=True).start()
+
+    def update_preview(self):
+        if not self.running:
+            return
+        ret, frame = self.cap.read()
+        if ret:
+            self.current_frame = frame.copy()
+            frame_show = cv2.resize(frame, FACE_PREVIEW_SIZE)
+            frame_rgb = cv2.cvtColor(frame_show, cv2.COLOR_BGR2RGB)
+            img = Image.fromarray(frame_rgb)
+            imgtk = ImageTk.PhotoImage(image=img)
+            self.preview_label.imgtk = imgtk
+            self.preview_label.configure(image=imgtk)
+        self.after(20, self.update_preview)
+
+    def on_capture(self):
+        if self.current_frame is None:
+            return
+
+        manager = FaceAuthManager()
+        feat = manager.extract_feature(self.current_frame)
+
+        if feat is None:
+            messagebox.showwarning("提示", "未检测到人脸，请正对摄像头", parent=self)
+            return
+
+        if self.mode == "collect":
+            self.collected_features.append(feat)
+            self.capture_count += 1
+            self.result_label.config(text=f"✅ 第 {self.capture_count} 张采集成功")
+            if self.capture_count < 3:
+                self.status_label.config(text=f"继续采集第 {self.capture_count + 1} 张人脸（共3张）")
+            else:
+                self.status_label.config(text="3张人脸采集完成！")
+                self.capture_btn.config(text="确认使用", bg="#44dd00")
+                self.capture_btn.config(command=self.confirm_collect)
+        else:
+            sim_list = [manager.calc_similarity(feat, ref) for ref in self.reference_features]
+            avg_sim = float(np.mean(sim_list))
+            max_sim = float(np.max(sim_list))
+            self.is_verified = avg_sim >= FACE_SIMILARITY_THRESHOLD
+            if self.is_verified:
+                self.result_label.config(text=f"✅ 验证通过  相似度：{avg_sim:.4f}", fg="#2e7d32")
+                self.capture_btn.config(state=tk.DISABLED)
+                self.after(800, self.confirm_verify)
+            else:
+                self.result_label.config(text=f"❌ 验证失败  相似度：{avg_sim:.4f}", fg="#c62828")
+
+    def confirm_collect(self):
+        self.result = {
+            'version': '1.0',
+            'features': [f.tolist() for f in self.collected_features],
+            'count': self.capture_count,
+            'threshold': FACE_SIMILARITY_THRESHOLD,
+            'created_at': time.time()
+        }
+        self.destroy()
+
+    def confirm_verify(self):
+        self.result = self.is_verified
+        self.destroy()
+
+    def cancel(self):
+        self.result = None
+        self.destroy()
+
+    def show(self):
+        self.wait_window()
+        return self.result, self.is_verified
+
+    def destroy(self):
+        self.running = False
+        if hasattr(self, 'cap') and self.cap.isOpened():
+            self.cap.release()
+        cv2.destroyAllWindows()
+        super().destroy()
+
+# ====================== 声纹识别核心组件 ======================
+class VoiceAuthManager:
+    _encoder = None
+
+    @classmethod
+    def get_encoder(cls):
+        if cls._encoder is None:
+            cls._encoder = VoiceEncoder()
+        return cls._encoder
+
+    @staticmethod
+    def record_audio(duration=VOICE_DURATION, sample_rate=VOICE_SAMPLE_RATE):
+        recording = sd.rec(int(duration * sample_rate), samplerate=sample_rate, channels=1, dtype='float32')
+        sd.wait()
+        return recording.flatten()
+
+    @staticmethod
+    def extract_embedding(audio, sample_rate=VOICE_SAMPLE_RATE):
+        wav = preprocess_wav(audio, source_sr=sample_rate)
+        encoder = VoiceAuthManager.get_encoder()
+        embed = encoder.embed_utterance(wav)
+        return embed
+
+    @staticmethod
+    def calc_similarity(embed1, embed2):
+        embed1 = embed1 / np.linalg.norm(embed1)
+        embed2 = embed2 / np.linalg.norm(embed2)
+        return float(np.dot(embed1, embed2))
+
+class VoiceAuthDialog(tk.Toplevel):
+    def __init__(self, parent, mode="collect", reference_embeddings=None, title="声纹验证"):
+        super().__init__(parent)
+        self.title(title)
+        self.geometry("480x380")
+        self.parent = parent
+        self.mode = mode
+        self.reference_embeddings = reference_embeddings
+        self.result = None
+        self.is_verified = False
+        self.collected_embeddings = []
+        self.capture_count = 0
+
+        self.configure(bg="#e0e0e0")
+        self.attributes('-alpha', 0.9)
+        self.attributes('-topmost', True)
+        self.transient(parent)
+        self.grab_set()
+
+        self.update_idletasks()
+        x = (parent.winfo_screenwidth() // 2) - (480 // 2)
+        y = (parent.winfo_screenheight() // 2) - (380 // 2)
+        self.geometry(f"480x380+{x}+{y}")
+
+        self.setup_ui()
+
+    def setup_ui(self):
+        prompt = "请点击按钮录制声音（每次3秒，共3次）" if self.mode == "collect" else "请点击按钮录制声音以验证身份"
+        self.status_label = tk.Label(self, text=prompt, font=("微软雅黑", 11), bg="#e0e0e0")
+        self.status_label.pack(pady=20)
+
+        self.progress_label = tk.Label(self, text="", font=("微软雅黑", 10), bg="#e0e0e0", fg="#333")
+        self.progress_label.pack(pady=10)
+
+        btn_frame = tk.Frame(self, bg="#e0e0e0")
+        btn_frame.pack(pady=20)
+
+        self.record_btn = tk.Button(
+            btn_frame, text="开始录音", command=self.on_record, width=12,
+            bg="#44dd00", fg="white", relief=tk.FLAT, activebackground="#33bb00"
+        )
+        self.record_btn.pack(side=tk.LEFT, padx=10)
+
+        tk.Button(
+            btn_frame, text="取消", command=self.cancel, width=10,
+            bg="#ff4444", fg="white", relief=tk.FLAT, activebackground="#dd2222"
+        ).pack(side=tk.LEFT, padx=10)
+
+    def on_record(self):
+        self.record_btn.config(state=tk.DISABLED, text="录音中...")
+        self.progress_label.config(text="正在录音... 请说话")
+        self.update()
+
+        def task():
+            try:
+                audio = VoiceAuthManager.record_audio(duration=VOICE_DURATION)
+                embed = VoiceAuthManager.extract_embedding(audio)
+                self.after(0, lambda emb=embed: self._safe_process_recording(emb))
+            except Exception as e:
+                err_msg = str(e)
+                self.after(0, lambda msg=err_msg: self._safe_record_error(msg))
+        threading.Thread(target=task, daemon=True).start()
+
+    def _safe_process_recording(self, embed):
+        try:
+            if not self.winfo_exists():
+                return
+            self.process_recording(embed)
+        except Exception:
+            pass
+
+    def _safe_record_error(self, error_msg):
+        try:
+            if not self.winfo_exists():
+                return
+            self.record_btn.config(state=tk.NORMAL, text="开始录音")
+            self.progress_label.config(text="")
+            messagebox.showerror("错误", f"录音失败：{error_msg}", parent=self)
+        except Exception:
+            pass
+
+    def process_recording(self, embed):
+        try:
+            self.record_btn.config(state=tk.NORMAL, text="开始录音")
+        except tk.TclError:
+            return
+
+        if self.mode == "collect":
+            self.collected_embeddings.append(embed)
+            self.capture_count += 1
+            self.progress_label.config(text=f"✅ 第 {self.capture_count} 次录音成功")
+            if self.capture_count < 3:
+                self.status_label.config(text=f"继续录制第 {self.capture_count + 1} 次声音（共3次）")
+            else:
+                self.status_label.config(text="3次声音录制完成！")
+                try:
+                    self.record_btn.config(text="确认使用", command=self.confirm_collect)
+                except tk.TclError:
+                    pass
+        else:
+            sim_list = [VoiceAuthManager.calc_similarity(embed, ref) for ref in self.reference_embeddings]
+            avg_sim = float(np.mean(sim_list))
+            self.is_verified = avg_sim >= VOICE_EMBEDDING_THRESHOLD
+            if self.is_verified:
+                self.progress_label.config(text=f"✅ 验证通过  相似度：{avg_sim:.4f}", fg="#2e7d32")
+                try:
+                    self.record_btn.config(state=tk.DISABLED)
+                except tk.TclError:
+                    pass
+                self.after(800, self.confirm_verify)
+            else:
+                self.progress_label.config(text=f"❌ 验证失败  相似度：{avg_sim:.4f}", fg="#c62828")
+
+    def confirm_collect(self):
+        self.result = {
+            'version': '1.0',
+            'embeddings': [emb.tolist() for emb in self.collected_embeddings],
+            'count': self.capture_count,
+            'threshold': VOICE_EMBEDDING_THRESHOLD,
+            'created_at': time.time()
+        }
+        self.destroy()
+
+    def confirm_verify(self):
+        self.result = self.is_verified
+        self.destroy()
+
+    def cancel(self):
+        self.result = None
+        self.destroy()
+
+    def show(self):
+        self.wait_window()
+        return self.result, self.is_verified
+
+# ====================== 主程序 ======================
+class GuifeiCryptoTool(tkinterdnd2.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("GuìFē! :) 防破密专家 v16.9.2")
+        self.geometry("1370x770")
+        self.configure(bg="#f0f0f0")
+        self.attributes('-alpha', 0.97)
+        self.center_window()
+
+        self.current_mode = "main"
+        self.selected_path = None
+        self.encryption_mode = tk.StringVar(value="aes_only")
+        self.use_grid_signature = tk.BooleanVar(value=False)
+        self.use_face_verification = tk.BooleanVar(value=False)
+        self.use_voice_verification = tk.BooleanVar(value=False)
+
+        self.show_loading()
+        self.setup_main_ui()
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    def show_about(self):
+        about_content = """
+名称：GuìFē! :)防破密专家
+           Windows版
+
+版本：v16.9.2
+
+特点：
+    AES-256 军用级加密
+    scipy密钥派生安全无虞
+    16 宫格密码再防护
+    新增人脸与声纹多认证
+    操作直观，零门槛
+    极简程序，稳定及时相应
+    真全方位文件数据铠甲
+
+    2025 GuìFē! :) 加密技术团队™
+
+附：上次更新版本 v16.8.9
+       本次更新内容:
+       修复了一些已知问题
+
+⚠️本产品仅供学习交流使用，
+        请勿用于商业用途"""
+        messagebox.showinfo("关于 GuìFē! :) 防破密专家", about_content)
+
+    def show_loading(self):
+        loading = LoadingWindow(self)
+        self.update()
+        time.sleep(1.5)
+        loading.destroy()
+
+    def center_window(self):
+        self.update_idletasks()
+        width = self.winfo_width()
+        height = self.winfo_height()
+        x = (self.winfo_screenwidth() // 2) - (width // 2)
+        y = (self.winfo_screenheight() // 2) - (height // 2)
+        self.geometry(f"{width}x{height}+{x}+{y}")
+
+    def setup_main_ui(self):
+        self.current_mode = "main"
+        for widget in self.winfo_children():
+            widget.destroy()
+
+        title_label = tk.Label(self, text="GuìFē! :) 防破密专家 v16.9.2", font=("微软雅黑", 16, "bold"), bg="#f0f0f0")
+        title_label.pack(pady=30)
+
+        func_frame = tk.Frame(self, bg="#f0f0f0")
+        func_frame.pack(fill=tk.X, padx=120, pady=10)
+
+        buttons = [
+            ("文件加密", self.show_file_encrypt_ui),
+            ("文件夹加密", self.show_folder_encrypt_ui),
+            ("文档加密", self.show_doc_encrypt_ui),
+            ("一键解密", self.show_auto_decrypt_ui),
+            ("关于", self.show_about)
+        ]
+
+        for text, cmd in buttons:
+            btn_frame = tk.Frame(func_frame, bg="#cccccc", height=70, relief=tk.RAISED, bd=2)
+            btn_frame.pack_propagate(False)
+            btn_frame.pack(fill=tk.X, pady=8)
+
+            def on_enter(e):
+                e.widget.configure(bg="#dddddd")
+            def on_leave(e):
+                e.widget.configure(bg="#cccccc")
+
+            btn_frame.bind("<Enter>", on_enter)
+            btn_frame.bind("<Leave>", on_leave)
+
+            btn_label = tk.Label(btn_frame, text=text, font=("微软雅黑", 14), bg="#cccccc")
+            btn_label.pack(expand=True)
+
+            btn_frame.bind("<Button-1>", lambda e, c=cmd: c())
+            btn_label.bind("<Button-1>", lambda e, c=cmd: c())
+
+        self.enable_drag_and_drop()
+
+        self.status_bar = tk.Label(self, text="就绪 | 支持拖拽文件/文件夹到对应功能界面",
+                                   bg="#f0f0f0", anchor=tk.W, font=("微软雅黑", 9))
+        self.status_bar.pack(side=tk.BOTTOM, fill=tk.X, padx=5, pady=2)
+
+    def enable_drag_and_drop(self):
+        self.drop_target_register(tkinterdnd2.DND_FILES)
+        self.dnd_bind('<<Drop>>', self.on_drop)
+        self.dnd_bind('<<DragEnter>>', self.on_drag_enter)
+        self.dnd_bind('<<DragLeave>>', self.on_drag_leave)
+        # 移除无意义的事件绑定
+        # self.dnd_bind('<<DragOver>>', self.on_drag_over)
+
+    def on_drag_enter(self, event):
+        self.configure(bg="#e8f0fe")
+
+    def on_drag_leave(self, event):
+        self.configure(bg="#f0f0f0")
+
+    def on_drop(self, event):
+        self.configure(bg="#f0f0f0")
+        files = self.tk.splitlist(event.data)
+        if not files:
+            return
+        dropped_path = files[0]
+        self.selected_path = dropped_path
+
+        if self.current_mode == "file":
+            self.file_path_var.set(dropped_path)
+            self.update_status(f"已加载文件：{os.path.basename(dropped_path)}")
+        elif self.current_mode == "folder":
+            if os.path.isdir(dropped_path):
+                self.folder_path_var.set(dropped_path)
+                self.update_status(f"已加载文件夹：{os.path.basename(dropped_path)}\n⚠️提示：解密地址应为单独空文件夹\n因为解密后将释放原文件夹内文件")
+            else:
+                messagebox.showwarning("提示", "当前为文件夹加密界面，请拖拽文件夹！")
+        elif self.current_mode == "decrypt":
+            self.decrypt_path_var.set(dropped_path)
+            self.update_status(f"已加载待解密文件：{os.path.basename(dropped_path)}")
+        elif self.current_mode == "main":
+            if os.path.isdir(dropped_path):
+                self.show_folder_encrypt_ui()
+                self.folder_path_var.set(dropped_path)
+            else:
+                self.show_file_encrypt_ui()
+                self.file_path_var.set(dropped_path)
+        elif self.current_mode == "doc":
+            messagebox.showinfo("提示", "文档加密界面不支持文件拖拽，请直接编辑文本！")
+
+    def show_back_button(self, parent):
+        back_btn = tk.Button(parent, text="← 返回主界面", command=self.setup_main_ui,
+                             bg="#999999", fg="white", relief=tk.FLAT, activebackground="#777777")
+        back_btn.pack(anchor=tk.NW, padx=10, pady=10)
+        return back_btn
+
+    def _add_verification_options(self, parent_frame):
+        frame = tk.Frame(parent_frame, bg="white" if parent_frame.cget('bg') == 'white' else "#f0f0f0")
+        frame.pack(fill=tk.X, padx=10, pady=10)
+        bg_color = frame.cget('bg')
+        tk.Label(frame, text="附加验证方式（可多选）：", bg=bg_color, font=("微软雅黑", 10)).pack(anchor=tk.W)
+        opts = tk.Frame(frame, bg=bg_color)
+        opts.pack(anchor=tk.W, pady=5)
+        tk.Checkbutton(opts, text="宫格加密", variable=self.use_grid_signature, bg=bg_color).pack(side=tk.LEFT, padx=5)
+        tk.Checkbutton(opts, text="人脸验证", variable=self.use_face_verification, bg=bg_color).pack(side=tk.LEFT, padx=5)
+        tk.Checkbutton(opts, text="声纹验证", variable=self.use_voice_verification, bg=bg_color).pack(side=tk.LEFT, padx=5)
+        return frame
+
+    def show_file_encrypt_ui(self):
+        self.current_mode = "file"
+        for widget in self.winfo_children():
+            widget.destroy()
+
+        self.show_back_button(self)
+        tk.Label(self, text="文件加密", font=("微软雅黑", 14, "bold"), bg="#f0f0f0").pack(pady=10)
+
+        main_frame = tk.Frame(self, bg="#f0f0f0")
+        main_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
+
+        left_frame = tk.Frame(main_frame, bg="white", width=500, relief=tk.RAISED, bd=1)
+        left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=10)
+        left_frame.pack_propagate(False)
+
+        tk.Label(left_frame, text="选择文件", font=("微软雅黑", 12), bg="white").pack(pady=10)
+
+        self.file_path_var = tk.StringVar(value=self.selected_path or "未选择文件")
+        path_label = tk.Label(left_frame, textvariable=self.file_path_var, bg="white",
+                              font=("微软雅黑", 10), wraplength=450, fg="#666666")
+        path_label.pack(pady=5, padx=10)
+
+        tk.Button(left_frame, text="浏览文件", command=self.select_file,
+                  bg="#999999", fg="white", relief=tk.FLAT, activebackground="#777777").pack(pady=10)
+
+        self._add_verification_options(left_frame)
+
+        right_frame = tk.Frame(main_frame, bg="white", width=500, relief=tk.RAISED, bd=1)
+        right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=10)
+        right_frame.pack_propagate(False)
+
+        tk.Label(right_frame, text="保存设置", font=("微软雅黑", 12), bg="white").pack(pady=10)
+
+        self.save_path_var = tk.StringVar(value="")
+        tk.Label(right_frame, text="保存路径：", bg="white", font=("微软雅黑", 10)).pack(anchor=tk.W, padx=10)
+        tk.Entry(right_frame, textvariable=self.save_path_var, bg="#f5f5f5", relief=tk.FLAT).pack(fill=tk.X, padx=10, pady=5)
+        tk.Button(right_frame, text="选择保存位置", command=self.select_file_save_path,
+                  bg="#999999", fg="white", relief=tk.FLAT, activebackground="#777777").pack(pady=5)
+
+        tk.Button(right_frame, text="开始加密", command=self.start_file_encryption,
+                  bg="#44dd00", fg="white", relief=tk.FLAT, activebackground="#33bb00",
+                  font=("微软雅黑", 12)).pack(side=tk.BOTTOM, pady=20, ipady=5)
+
+        self.progress_var = tk.DoubleVar()
+        self.progress_bar = ttk.Progressbar(self, variable=self.progress_var, maximum=100)
+        self.progress_bar.pack(side=tk.BOTTOM, fill=tk.X, padx=20, pady=10)
+
+        style = ttk.Style()
+        style.configure("grey.Horizontal.TProgressbar", troughcolor='#e0e0e0', background='#44dd00')
+        self.progress_bar.config(style="grey.Horizontal.TProgressbar")
+
+        self.enable_drag_and_drop()
+
+        self.status_bar = tk.Label(self, text="文件加密界面 | 支持拖拽文件到此处 | 加密后默认使用原文件名",
+                                   bg="#f0f0f0", anchor=tk.W, font=("微软雅黑", 9))
+        self.status_bar.pack(side=tk.BOTTOM, fill=tk.X, padx=5, pady=2)
+
+    def show_folder_encrypt_ui(self):
+        self.current_mode = "folder"
+        for widget in self.winfo_children():
+            widget.destroy()
+
+        self.show_back_button(self)
+        tk.Label(self, text="文件夹加密", font=("微软雅黑", 14, "bold"), bg="#f0f0f0").pack(pady=10)
+
+        main_frame = tk.Frame(self, bg="#f0f0f0")
+        main_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
+
+        left_frame = tk.Frame(main_frame, bg="white", width=500, relief=tk.RAISED, bd=1)
+        left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=10)
+        left_frame.pack_propagate(False)
+
+        tk.Label(left_frame, text="选择文件夹", font=("微软雅黑", 12), bg="white").pack(pady=10)
+
+        self.folder_path_var = tk.StringVar(value=self.selected_path or "未选择文件夹")
+        path_label = tk.Label(left_frame, textvariable=self.folder_path_var, bg="white",
+                              font=("微软雅黑", 10), wraplength=450, fg="#666666")
+        path_label.pack(pady=5, padx=10)
+
+        tk.Button(left_frame, text="浏览文件夹", command=self.select_folder,
+                  bg="#999999", fg="white", relief=tk.FLAT, activebackground="#777777").pack(pady=10)
+
+        self._add_verification_options(left_frame)
+
+        right_frame = tk.Frame(main_frame, bg="white", width=500, relief=tk.RAISED, bd=1)
+        right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=10)
+        right_frame.pack_propagate(False)
+
+        tk.Label(right_frame, text="保存设置", font=("微软雅黑", 12), bg="white").pack(pady=10)
+
+        self.folder_save_var = tk.StringVar(value="")
+        tk.Label(right_frame, text="保存路径：", bg="white", font=("微软雅黑", 10)).pack(anchor=tk.W, padx=10)
+        tk.Entry(right_frame, textvariable=self.folder_save_var, bg="#f5f5f5", relief=tk.FLAT).pack(fill=tk.X, padx=10, pady=5)
+        tk.Button(right_frame, text="选择保存位置", command=self.select_folder_save_path,
+                  bg="#999999", fg="white", relief=tk.FLAT, activebackground="#777777").pack(pady=5)
+
+        tk.Button(right_frame, text="开始加密", command=self.start_folder_encryption,
+                  bg="#44dd00", fg="white", relief=tk.FLAT, activebackground="#33bb00",
+                  font=("微软雅黑", 12)).pack(side=tk.BOTTOM, pady=20, ipady=5)
+
+        self.progress_var = tk.DoubleVar()
+        self.progress_bar = ttk.Progressbar(self, variable=self.progress_var, maximum=100)
+        self.progress_bar.pack(side=tk.BOTTOM, fill=tk.X, padx=20, pady=10)
+
+        self.enable_drag_and_drop()
+
+        self.status_bar = tk.Label(self, text="文件夹加密界面 | 支持拖拽文件夹到此处 | 加密后默认使用原文件夹名",
+                                   bg="#f0f0f0", anchor=tk.W, font=("微软雅黑", 9))
+        self.status_bar.pack(side=tk.BOTTOM, fill=tk.X, padx=5, pady=2)
+
+    def show_doc_encrypt_ui(self):
+        self.current_mode = "doc"
+        for widget in self.winfo_children():
+            widget.destroy()
+
+        self.show_back_button(self)
+        tk.Label(self, text="文档加密", font=("微软雅黑", 14, "bold"), bg="#f0f0f0").pack(pady=10)
+
+        text_frame = tk.Frame(self, bg="#f0f0f0")
+        text_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
+
+        self.doc_text = scrolledtext.ScrolledText(text_frame, font=("Consolas", 10), wrap=tk.WORD,
+                                                  bg="#f5f5f5", relief=tk.FLAT, bd=1, height=25)
+        self.doc_text.pack(fill=tk.BOTH, expand=True, pady=5)
+
+        ver_frame = tk.Frame(self, bg="#f0f0f0")
+        ver_frame.pack(fill=tk.X, padx=20, pady=5)
+        self._add_verification_options(ver_frame)
+
+        btn_frame = tk.Frame(self, bg="#f0f0f0")
+        btn_frame.pack(fill=tk.X, padx=20, pady=10)
+
+        tk.Button(btn_frame, text="保存加密文档", command=self.save_encrypted_doc,
+                  bg="#44dd00", fg="white", relief=tk.FLAT, activebackground="#33bb00",
+                  font=("微软雅黑", 10)).pack(side=tk.RIGHT, padx=5)
+        tk.Button(btn_frame, text="打开加密文档", command=self.open_encrypted_doc,
+                  bg="#999999", fg="white", relief=tk.FLAT, activebackground="#777777",
+                  font=("微软雅黑", 10)).pack(side=tk.RIGHT, padx=5)
+        tk.Button(btn_frame, text="清空内容", command=lambda: self.doc_text.delete(1.0, tk.END),
+                  bg="#ff4444", fg="white", relief=tk.FLAT, activebackground="#dd2222",
+                  font=("微软雅黑", 10)).pack(side=tk.RIGHT, padx=5)
+
+        self.status_bar = tk.Label(self, text="文档加密界面 | 直接编辑文本内容",
+                                   bg="#f0f0f0", anchor=tk.W, font=("微软雅黑", 9))
+        self.status_bar.pack(side=tk.BOTTOM, fill=tk.X, padx=5, pady=2)
+
+    def show_auto_decrypt_ui(self):
+        self.current_mode = "decrypt"
+        for widget in self.winfo_children():
+            widget.destroy()
+
+        self.show_back_button(self)
+        tk.Label(self, text="自动解密", font=("微软雅黑", 14, "bold"), bg="#f0f0f0").pack(pady=10)
+
+        self.decrypt_path_var = tk.StringVar(value=self.selected_path or "未选择加密文件")
+        tk.Label(self, textvariable=self.decrypt_path_var, bg="#f0f0f0", font=("微软雅黑", 10), fg="#666666").pack(pady=10)
+
+        btn_frame = tk.Frame(self, bg="#f0f0f0")
+        btn_frame.pack(pady=20)
+
+        tk.Button(btn_frame, text="选择加密文件", command=self.select_encrypted_file,
+                  bg="#999999", fg="white", relief=tk.FLAT, activebackground="#777777",
+                  font=("微软雅黑", 10)).pack(side=tk.LEFT, padx=10)
+        tk.Button(btn_frame, text="开始解密", command=self.start_auto_decryption,
+                  bg="#44dd00", fg="white", relief=tk.FLAT, activebackground="#33bb00",
+                  font=("微软雅黑", 10)).pack(side=tk.LEFT, padx=10)
+
+        self.progress_var = tk.DoubleVar()
+        self.progress_bar = ttk.Progressbar(self, variable=self.progress_var, maximum=100)
+        self.progress_bar.pack(side=tk.BOTTOM, fill=tk.X, padx=20, pady=10)
+
+        self.enable_drag_and_drop()
+
+        self.status_bar = tk.Label(self, text="自动解密界面 | 支持拖拽加密文件到此处 | 解密后默认显示原文件名",
+                                   bg="#f0f0f0", anchor=tk.W, font=("微软雅黑", 9))
+        self.status_bar.pack(side=tk.BOTTOM, fill=tk.X, padx=5, pady=2)
+
+    # ====================== 核心加密解密逻辑 ======================
+    def _derive_keys(self, password, salt):
+        key_material = hashlib.pbkdf2_hmac(
+            KDF_HASH_ALG,
+            password.encode('utf-8'),
+            salt,
+            KDF_ITERATIONS,
+            dklen=AES_KEY_LENGTH * 2
+        )
+        return key_material[:AES_KEY_LENGTH], key_material[AES_KEY_LENGTH:]
+
+    def _encrypt_single_layer(self, data, password):
+        salt = get_random_bytes(SALT_LENGTH)
+        nonce = get_random_bytes(GCM_NONCE_LENGTH)
+        encryption_key, hmac_key = self._derive_keys(password, salt)
+
+        cipher = AES.new(encryption_key, AES.MODE_GCM, nonce=nonce)
+        ciphertext, tag = cipher.encrypt_and_digest(pad(data, AES.block_size))
+
+        packet = ENCRYPTION_MAGIC + VERSION + salt + nonce + tag + ciphertext
+        hmac_digest = hmac.new(hmac_key, packet, SIGNATURE_HASH_ALG).digest()
+
+        return hmac_digest + packet
+
+    def _decrypt_single_layer(self, encrypted_data, password):
+        if len(encrypted_data) < HMAC_LENGTH + len(ENCRYPTION_MAGIC) + len(VERSION) + SALT_LENGTH + GCM_NONCE_LENGTH + 16:
+            raise ValueError("无效的加密数据")
+
+        hmac_digest = encrypted_data[:HMAC_LENGTH]
+        packet = encrypted_data[HMAC_LENGTH:]
+
+        if packet[:len(ENCRYPTION_MAGIC)] != ENCRYPTION_MAGIC:
+            raise ValueError("无效的加密文件")
+
+        salt = packet[len(ENCRYPTION_MAGIC)+len(VERSION):len(ENCRYPTION_MAGIC)+len(VERSION)+SALT_LENGTH]
+        nonce = packet[len(ENCRYPTION_MAGIC)+len(VERSION)+SALT_LENGTH:len(ENCRYPTION_MAGIC)+len(VERSION)+SALT_LENGTH+GCM_NONCE_LENGTH]
+        tag = packet[len(ENCRYPTION_MAGIC)+len(VERSION)+SALT_LENGTH+GCM_NONCE_LENGTH:len(ENCRYPTION_MAGIC)+len(VERSION)+SALT_LENGTH+GCM_NONCE_LENGTH+16]
+        ciphertext = packet[len(ENCRYPTION_MAGIC)+len(VERSION)+SALT_LENGTH+GCM_NONCE_LENGTH+16:]
+
+        encryption_key, hmac_key = self._derive_keys(password, salt)
+
+        calculated_hmac = hmac.new(hmac_key, packet, SIGNATURE_HASH_ALG).digest()
+        if not hmac.compare_digest(hmac_digest, calculated_hmac):
+            raise ValueError("密码错误或文件已被篡改")
+
+        cipher = AES.new(encryption_key, AES.MODE_GCM, nonce=nonce)
+        plaintext = unpad(cipher.decrypt_and_verify(ciphertext, tag), AES.block_size)
+
+        return plaintext
+
+    def _convert_grid_signature(self, signature):
+        if not signature:
+            return b''
+        signature_str = signature.get('signature_string', '')
+        return base64.b64encode(signature_str.encode('utf-8'))
+
+    def _restore_grid_signature(self, special_data):
+        if not special_data:
+            return {}
+        signature_str = base64.b64decode(special_data).decode('utf-8')
+        grid_pad = GridSignaturePad(self)
+        point_sequence = grid_pad.parse_signature_string(signature_str)
+        return {
+            'version': '1.0',
+            'grid_size': GRID_SIZE,
+            'signature_string': signature_str,
+            'point_sequence': point_sequence,
+            'sequence_length': len(point_sequence),
+            'hash': hashlib.sha256(signature_str.encode()).hexdigest()
+        }
+
+    def _convert_face_signature(self, face_data):
+        if not face_data:
+            return b''
+        return pickle.dumps(face_data)
+
+    def _restore_face_signature(self, face_bytes):
+        if not face_bytes:
+            return {}
+        return pickle.loads(face_bytes)
+
+    def _convert_voice_signature(self, voice_data):
+        if not voice_data:
+            return b''
+        return pickle.dumps(voice_data)
+
+    def _restore_voice_signature(self, voice_bytes):
+        if not voice_bytes:
+            return {}
+        return pickle.loads(voice_bytes)
+
+    def encrypt_multi_layer(self, data, password, file_type, signature=None, face_signature=None, voice_signature=None,
+                            verifications=None, original_filename="", grid_password=None, use_grid_outer=False):
+        try:
+            self.update_progress(10)
+
+            layer1 = self._encrypt_single_layer(data, password)
+            self.update_progress(30)
+
+            encrypted_signature = b''
+            if signature and not use_grid_outer:
+                special_signature = self._convert_grid_signature(signature)
+                encrypted_signature = self._encrypt_single_layer(special_signature, password)
+
+            encrypted_face = b''
+            if face_signature:
+                face_bytes = self._convert_face_signature(face_signature)
+                encrypted_face = self._encrypt_single_layer(face_bytes, password)
+
+            encrypted_voice = b''
+            if voice_signature:
+                voice_bytes = self._convert_voice_signature(voice_signature)
+                encrypted_voice = self._encrypt_single_layer(voice_bytes, password)
+
+            folder_data = {
+                'content': layer1,
+                'signature': encrypted_signature,
+                'face_signature': encrypted_face,
+                'voice_signature': encrypted_voice,
+                'type': file_type,
+                'verifications': verifications if verifications else [],
+                'mode': self.encryption_mode.get().encode('utf-8'),
+                'timestamp': time.time(),
+                'original_filename': original_filename.encode('utf-8'),
+                'original_basename': os.path.basename(original_filename).encode('utf-8'),
+                'use_grid_outer': use_grid_outer
+            }
+            folder_bytes = pickle.dumps(folder_data)
+            self.update_progress(50)
+
+            if use_grid_outer and grid_password:
+                inner_encrypted = self._encrypt_single_layer(folder_bytes, password)
+                self.update_progress(70)
+                outer_encrypted = self._encrypt_single_layer(inner_encrypted, grid_password)
+                final_encrypted = GRID_FLAG_BYTE + outer_encrypted
+            else:
+                final_encrypted = self._encrypt_single_layer(folder_bytes, password)
+                final_encrypted = NO_GRID_FLAG_BYTE + final_encrypted
+
+            self.update_progress(100)
+            return final_encrypted
+
+        except Exception as e:
+            self.update_progress(0)
+            raise Exception(f"加密失败: {str(e)}")
+
+    def decrypt_multi_layer(self, encrypted_data, password, verify_signature=True, verify_face=True, verify_voice=True):
+        try:
+            self.update_progress(10)
+
+            if len(encrypted_data) < 1:
+                raise ValueError("无效的加密数据")
+
+            flag_byte = encrypted_data[:1]
+            data_without_flag = encrypted_data[1:]
+            use_grid_outer = (flag_byte == GRID_FLAG_BYTE)
+
+            if use_grid_outer:
+                grid_pad = GridSignaturePad(self, "请输入加密时绘制的宫格密码（顺序需完全一致）")
+                grid_result, _ = grid_pad.show()
+                if not grid_result:
+                    raise ValueError("宫格密码输入取消")
+                grid_password = grid_result['signature_string']
+                inner_encrypted = self._decrypt_single_layer(data_without_flag, grid_password)
+                folder_bytes = self._decrypt_single_layer(inner_encrypted, password)
+            else:
+                if flag_byte != NO_GRID_FLAG_BYTE:
+                    raise ValueError("无效的加密文件标志")
+                folder_bytes = self._decrypt_single_layer(data_without_flag, password)
+
+            self.update_progress(50)
+
+            folder_data = pickle.loads(folder_bytes)
+            content_data = folder_data['content']
+            signature_data = folder_data.get('signature', b'')
+            face_signature_data = folder_data.get('face_signature', b'')
+            voice_signature_data = folder_data.get('voice_signature', b'')
+            file_type = folder_data.get('type', FILE_TYPE_TEXT)
+            verifications = folder_data.get('verifications', [])
+            original_filename = folder_data.get('original_filename', b'').decode('utf-8')
+            original_basename = folder_data.get('original_basename', b'').decode('utf-8')
+            use_grid_outer_stored = folder_data.get('use_grid_outer', False)
+
+            is_verified_all = True
+
+            if verify_signature and 'grid' in verifications and signature_data and not use_grid_outer_stored:
+                special_signature = self._decrypt_single_layer(signature_data, password)
+                ref_signature = self._restore_grid_signature(special_signature)
+                grid_pad = GridSignaturePad(self, "宫格验证", ref_signature)
+                _, is_verified = grid_pad.show()
+                if not is_verified:
+                    raise ValueError("宫格验证失败：连接顺序不匹配")
+                is_verified_all = is_verified_all and is_verified
+
+            if verify_face and 'face' in verifications and face_signature_data:
+                face_bytes = self._decrypt_single_layer(face_signature_data, password)
+                ref_face_data = self._restore_face_signature(face_bytes)
+                ref_features = [np.array(feat) for feat in ref_face_data['features']]
+                face_dialog = FaceAuthDialog(self, mode="verify", reference_features=ref_features, title="人脸验证")
+                _, face_verified = face_dialog.show()
+                if not face_verified:
+                    raise ValueError("人脸验证失败：身份不匹配")
+                is_verified_all = is_verified_all and face_verified
+
+            if verify_voice and 'voice' in verifications and voice_signature_data:
+                voice_bytes = self._decrypt_single_layer(voice_signature_data, password)
+                ref_voice_data = self._restore_voice_signature(voice_bytes)
+                ref_embeddings = [np.array(emb) for emb in ref_voice_data['embeddings']]
+                voice_dialog = VoiceAuthDialog(self, mode="verify", reference_embeddings=ref_embeddings, title="声纹验证")
+                _, voice_verified = voice_dialog.show()
+                if not voice_verified:
+                    raise ValueError("声纹验证失败：身份不匹配")
+                is_verified_all = is_verified_all and voice_verified
+
+            self.update_progress(70)
+
+            plain_data = self._decrypt_single_layer(content_data, password)
+            self.update_progress(100)
+
+            return plain_data, file_type, is_verified_all, original_filename, original_basename
+
+        except Exception as e:
+            self.update_progress(0)
+            raise Exception(f"解密失败: {str(e)}")
+
+    # ====================== 辅助方法 ======================
+    def update_progress(self, value):
+        self.after(0, lambda v=value: self._safe_update_progress(v))
+
+    def _safe_update_progress(self, value):
+        try:
+            if hasattr(self, 'progress_var') and self.progress_var:
+                self.progress_var.set(value)
+                self.update_idletasks()
+        except:
+            pass
+
+    def update_status(self, text):
+        self.after(0, lambda t=text: self._safe_update_status(t))
+
+    def _safe_update_status(self, text):
+        try:
+            if not hasattr(self, 'status_bar') or not self.status_bar.winfo_exists():
+                self.status_bar = tk.Label(self, text=text, bg="#f0f0f0", anchor=tk.W, font=("微软雅黑", 9))
+                self.status_bar.pack(side=tk.BOTTOM, fill=tk.X, padx=5, pady=2)
+            else:
+                self.status_bar.config(text=text)
+            self.update_idletasks()
+        except:
+            pass
+
+    def select_file(self):
+        path = filedialog.askopenfilename(title="选择要加密的文件")
+        if path:
+            self.selected_path = path
+            self.file_path_var.set(path)
+
+    def select_folder(self):
+        path = filedialog.askdirectory(title="选择要加密的文件夹")
+        if path:
+            self.selected_path = path
+            self.folder_path_var.set(path)
+
+    def select_file_save_path(self):
+        if not self.selected_path:
+            messagebox.showwarning("警告", "请先选择要加密的文件！")
+            return
+        original_basename = os.path.basename(self.selected_path)
+        default_filename = f"{original_basename}.guifei"
+        path = filedialog.asksaveasfilename(
+            defaultextension='.guifei',
+            filetypes=[("加密文件", "*.guifei"), ("所有文件", "*.*")],
+            title="保存",
+            initialfile=default_filename
+        )
+        if path:
+            self.save_path_var.set(path)
+
+    def select_folder_save_path(self):
+        if not self.selected_path:
+            messagebox.showwarning("警告", "请先选择要加密的文件夹！")
+            return
+        original_basename = os.path.basename(self.selected_path)
+        default_filename = f"{original_basename}.guifeinext"
+        path = filedialog.asksaveasfilename(
+            defaultextension='.guifeinext',
+            filetypes=[("加密文件夹", "*.guifeinext"), ("所有文件", "*.*")],
+            title="保存",
+            initialfile=default_filename
+        )
+        if path:
+            self.folder_save_var.set(path)
+
+    def select_encrypted_file(self):
+        path = filedialog.askopenfilename(
+            filetypes=[
+                ("所有支持的文件", "*.guifei *.guifeinext *.msc"),
+                ("加密文件", "*.guifei"),
+                ("加密文件夹", "*.guifeinext"),
+                ("加密文本", "*.msc"),
+                ("所有文件", "*.*")
+            ],
+            title="选择要解密的文件"
+        )
+        if path:
+            self.decrypt_path_var.set(path)
+
+    def _collect_verifications(self):
+        verifications = []
+        signature = None
+        face_sig = None
+        voice_sig = None
+        grid_password = None
+        use_grid_outer = False
+
+        if self.use_grid_signature.get():
+            grid_pad = GridSignaturePad(self, "设置宫格二次加密密码")
+            sig, _ = grid_pad.show()
+            if not sig:
+                return None, None, None, None, None, False
+            signature = sig
+            verifications.append('grid')
+            grid_password = sig['signature_string']
+            use_grid_outer = True
+
+        if self.use_face_verification.get():
+            face_dialog = FaceAuthDialog(self, mode="collect", title="设置人脸验证")
+            fs, _ = face_dialog.show()
+            if not fs:
+                return None, None, None, None, None, False
+            face_sig = fs
+            verifications.append('face')
+
+        if self.use_voice_verification.get():
+            voice_dialog = VoiceAuthDialog(self, mode="collect", title="设置声纹验证")
+            vs, _ = voice_dialog.show()
+            if not vs:
+                return None, None, None, None, None, False
+            voice_sig = vs
+            verifications.append('voice')
+
+        return signature, face_sig, voice_sig, verifications, grid_password, use_grid_outer
+
+    def start_file_encryption(self):
+        if not self.selected_path:
+            messagebox.showwarning("警告", "请先选择要加密的文件！")
+            return
+
+        save_path = self.save_path_var.get()
+        if not save_path:
+            original_basename = os.path.basename(self.selected_path)
+            default_filename = f"{original_basename}.guifei"
+            save_path = filedialog.asksaveasfilename(
+                defaultextension='.guifei',
+                filetypes=[("加密文件", "*.guifei")],
+                title="选择保存位置",
+                initialfile=default_filename
+            )
+            if not save_path:
+                return
+            self.save_path_var.set(save_path)
+
+        password = PasswordDialog(self, "加密密码", "请输入加密密码:").show()
+        if not password:
+            return
+
+        result = self._collect_verifications()
+        if result is None or (result[0] is None and result[4] is None):
+            return
+        signature, face_sig, voice_sig, verifications, grid_password, use_grid_outer = result
+
+        def encrypt_task():
+            try:
+                self.update_progress(0)
+                self.update_status("正在加密文件...")
+
+                with open(self.selected_path, 'rb') as f:
+                    file_data = f.read()
+                self.update_progress(20)
+
+                encrypted_data = self.encrypt_multi_layer(
+                    file_data,
+                    password,
+                    FILE_TYPE_FILE,
+                    signature=signature,
+                    face_signature=face_sig,
+                    voice_signature=voice_sig,
+                    verifications=verifications,
+                    original_filename=self.selected_path,
+                    grid_password=grid_password,
+                    use_grid_outer=use_grid_outer
+                )
+                self.update_progress(80)
+
+                with open(save_path, 'wb') as f:
+                    f.write(encrypted_data)
+                self.update_progress(100)
+
+                self.update_status(f"文件加密完成：{os.path.basename(save_path)}")
+                self.after(0, lambda: messagebox.showinfo("成功", "文件加密完成！"))
+
+            except Exception as e:
+                error_msg = f"加密失败：{str(e)}"
+                self.update_progress(0)
+                self.update_status(error_msg)
+                self.after(0, lambda msg=error_msg: messagebox.showerror("错误", msg))
+
+        threading.Thread(target=encrypt_task, daemon=True).start()
+
+    def start_folder_encryption(self):
+        if not self.selected_path:
+            messagebox.showwarning("警告", "请先选择要加密的文件夹！")
+            return
+
+        save_path = self.folder_save_var.get()
+        if not save_path:
+            original_basename = os.path.basename(self.selected_path)
+            default_filename = f"{original_basename}.guifeinext"
+            save_path = filedialog.asksaveasfilename(
+                defaultextension='.guifeinext',
+                filetypes=[("加密文件夹", "*.guifeinext")],
+                title="选择保存位置",
+                initialfile=default_filename
+            )
+            if not save_path:
+                return
+            self.folder_save_var.set(save_path)
+
+        password = PasswordDialog(self, "加密密码", "请输入加密密码:").show()
+        if not password:
+            return
+
+        result = self._collect_verifications()
+        if result is None or (result[0] is None and result[4] is None):
+            return
+        signature, face_sig, voice_sig, verifications, grid_password, use_grid_outer = result
+
+        def encrypt_task():
+            try:
+                self.update_progress(0)
+                self.update_status("正在压缩并加密文件夹...")
+
+                temp_zip = tempfile.NamedTemporaryFile(delete=False, suffix='.zip')
+                with zipfile.ZipFile(temp_zip, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                    for root, dirs, files in os.walk(self.selected_path):
+                        for file in files:
+                            file_path = os.path.join(root, file)
+                            arcname = os.path.relpath(file_path, self.selected_path)
+                            zipf.write(file_path, arcname)
+                temp_zip.close()
+                self.update_progress(30)
+
+                with open(temp_zip.name, 'rb') as f:
+                    zip_data = f.read()
+                os.unlink(temp_zip.name)
+                self.update_progress(50)
+
+                encrypted_data = self.encrypt_multi_layer(
+                    zip_data,
+                    password,
+                    FILE_TYPE_FOLDER,
+                    signature=signature,
+                    face_signature=face_sig,
+                    voice_signature=voice_sig,
+                    verifications=verifications,
+                    original_filename=self.selected_path,
+                    grid_password=grid_password,
+                    use_grid_outer=use_grid_outer
+                )
+                self.update_progress(80)
+
+                with open(save_path, 'wb') as f:
+                    f.write(encrypted_data)
+                self.update_progress(100)
+
+                self.update_status(f"文件夹加密完成：{os.path.basename(save_path)}")
+                self.after(0, lambda: messagebox.showinfo("成功", "文件夹加密完成！"))
+
+            except Exception as e:
+                error_msg = f"加密失败：{str(e)}"
+                self.update_progress(0)
+                self.update_status(error_msg)
+                self.after(0, lambda msg=error_msg: messagebox.showerror("错误", msg))
+
+        threading.Thread(target=encrypt_task, daemon=True).start()
+
+    def save_encrypted_doc(self):
+        content = self.doc_text.get(1.0, tk.END).encode('utf-8')
+        if not content.strip():
+            messagebox.showwarning("警告", "文档内容不能为空！")
+            return
+
+        save_path = filedialog.asksaveasfilename(
+            defaultextension='.msc',
+            filetypes=[("加密文档", "*.msc")],
+            title="选择保存位置",
+            initialfile="document.msc"
+        )
+        if not save_path:
+            return
+
+        password = PasswordDialog(self, "加密密码", "请输入加密密码:").show()
+        if not password:
+            return
+
+        result = self._collect_verifications()
+        if result is None or (result[0] is None and result[4] is None):
+            return
+        signature, face_sig, voice_sig, verifications, grid_password, use_grid_outer = result
+
+        try:
+            encrypted_data = self.encrypt_multi_layer(
+                content,
+                password,
+                FILE_TYPE_TEXT,
+                signature=signature,
+                face_signature=face_sig,
+                voice_signature=voice_sig,
+                verifications=verifications,
+                original_filename="document.msc",
+                grid_password=grid_password,
+                use_grid_outer=use_grid_outer
+            )
+            with open(save_path, 'wb') as f:
+                f.write(encrypted_data)
+            messagebox.showinfo("成功", "文档加密保存完成！")
+        except Exception as e:
+            messagebox.showerror("错误", f"保存失败：{str(e)}")
+
+    def open_encrypted_doc(self):
+        file_path = filedialog.askopenfilename(
+            filetypes=[("加密文档", "*.msc"), ("所有文件", "*.*")],
+            title="打开加密文档"
+        )
+        if not file_path:
+            return
+
+        password = PasswordDialog(self, "解密密码", "请输入解密密码:", show_strength=False).show()
+        if not password:
+            return
+
+        try:
+            with open(file_path, 'rb') as f:
+                encrypted_data = f.read()
+
+            plain_data, _, _, _, original_basename = self.decrypt_multi_layer(encrypted_data, password)
+
+            self.doc_text.delete(1.0, tk.END)
+            self.doc_text.insert(tk.END, plain_data.decode('utf-8', errors='replace'))
+            messagebox.showinfo("成功", f"文档解密完成！原文件名：{original_basename}")
+
+        except Exception as e:
+            messagebox.showerror("错误", f"解密失败：{str(e)}")
+
+    def start_auto_decryption(self):
+        file_path = self.decrypt_path_var.get()
+        if file_path == "未选择加密文件":
+            messagebox.showwarning("警告", "请先选择要解密的文件！")
+            return
+
+        password = PasswordDialog(self, "解密密码", "请输入解密密码:", show_strength=False).show()
+        if not password:
+            return
+
+        def decrypt_task():
+            try:
+                self.update_progress(0)
+                self.update_status("正在解密文件...")
+
+                with open(file_path, 'rb') as f:
+                    encrypted_data = f.read()
+                self.update_progress(20)
+
+                plain_data, file_type, _, original_filename, original_basename = self.decrypt_multi_layer(encrypted_data, password)
+                self.update_progress(60)
+
+                if file_type == FILE_TYPE_TEXT:
+                    self.after(0, lambda p=plain_data, b=original_basename: self._show_decrypted_text(p, b))
+
+                elif file_type == FILE_TYPE_FILE:
+                    def save_file():
+                        save_path = filedialog.asksaveasfilename(
+                            title="保存文件位置",
+                            initialfile=original_basename or os.path.splitext(os.path.basename(file_path))[0]
+                        )
+                        if save_path:
+                            with open(save_path, 'wb') as f:
+                                f.write(plain_data)
+                            self.update_status(f"文件解密完成：{os.path.basename(save_path)}")
+                            messagebox.showinfo("成功", f"文件解密完成：{os.path.basename(save_path)}")
+                    self.after(0, save_file)
+
+                elif file_type == FILE_TYPE_FOLDER:
+                    def extract_folder():
+                        parent_dir = filedialog.askdirectory(title="选择文件夹保存位置")
+                        if not parent_dir:
+                            self.update_status("解密取消：未选择保存位置")
+                            return
+
+                        target_dir = os.path.join(parent_dir, original_basename)
+                        counter = 1
+                        base_name = original_basename
+                        while os.path.exists(target_dir):
+                            target_dir = os.path.join(parent_dir, f"{base_name}_{counter}")
+                            counter += 1
+                        os.makedirs(target_dir, exist_ok=True)
+
+                        temp_zip = tempfile.NamedTemporaryFile(delete=False, suffix='.zip')
+                        temp_zip.write(plain_data)
+                        temp_zip.close()
+
+                        with zipfile.ZipFile(temp_zip.name, 'r') as zipf:
+                            total_files = len(zipf.namelist())
+                            processed = 0
+                            for file_info in zipf.infolist():
+                                zipf.extract(file_info, target_dir)
+                                processed += 1
+                                self.update_progress(60 + int(30 * processed / total_files))
+
+                        os.unlink(temp_zip.name)
+                        self.update_progress(100)
+
+                        self.update_status(f"文件夹解密完成：已解压到 {target_dir}")
+                        self.after(0, lambda td=target_dir: messagebox.showinfo(
+                            "成功",
+                            f"文件夹解密完成！\n已解压到：{td}"
+                        ))
+                    self.after(0, extract_folder)
+
+                self.update_progress(100)
+
+            except Exception as e:
+                error_msg = f"解密失败：{str(e)}"
+                self.update_progress(0)
+                self.update_status(error_msg)
+                self.after(0, lambda msg=error_msg: messagebox.showerror("错误", msg))
+
+        threading.Thread(target=decrypt_task, daemon=True).start()
+
+    def _show_decrypted_text(self, plain_data, original_basename):
+        if not hasattr(self, 'doc_text') or not self.doc_text.winfo_exists():
+            self.show_doc_encrypt_ui()
+        self.after(100, lambda pd=plain_data, ob=original_basename: self._safe_display_text(pd, ob))
+
+    def _safe_display_text(self, plain_data, original_basename):
+        try:
+            self.doc_text.delete(1.0, tk.END)
+            self.doc_text.insert(tk.END, plain_data.decode('utf-8', errors='replace'))
+            self.update_status(f"文本解密完成：原文件名 {original_basename}")
+            messagebox.showinfo(
+                "成功",
+                f"文本解密完成！\n原文件名：{original_basename}\n已加载到文档编辑区"
+            )
+        except Exception as e:
+            self.update_status(f"文本显示失败：{str(e)}")
+            messagebox.showwarning(
+                "提示",
+                f"文本解密成功但显示失败！\n原文件名：{original_basename}\n错误：{str(e)}\n请手动打开文档加密界面查看"
+            )
+
+    def on_close(self):
+        if messagebox.askokcancel("退出", "确定要退出GuìFē! :)防破密专家吗？"):
+            self.destroy()
+            sys.exit(0)
+
+# ====================== 主程序入口 ======================
+
+ICO_BASE64 = '''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xgfa2N4ANEBoAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAx727AMa9ugTIwscTt7TFBMfDzQAREVoAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA///////////////////B///DAf//AgD//gMAP/wDAB/4A4AP8AeAD+AQBAfgYAYH4GAHA8DgBwPA4AeDwOAHg8DgBwPA4AcDwPAPA+BxjgfgMAwH4AAQB/AAAA/4AYAf/ACAP/4AwH//gMH//4HH//+P//////////////////8='''
+
+if __name__ == "__main__":
+    # 设置未捕获异常钩子（仅主程序运行）
+    def _global_exception_hook(exc_type, exc_value, exc_tb):
+        err_msg = ''.join(traceback.format_exception(exc_type, exc_value, exc_tb))
+        messagebox.showerror("未捕获的异常", err_msg[:800])
+        with open("guifei_error.log", "a", encoding="utf-8") as f:
+            f.write(err_msg)
+
+    sys.excepthook = _global_exception_hook
+
+    # 高DPI适配（Windows）
+    try:
+        from ctypes import windll
+        windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:
+        pass
+
+    app = GuifeiCryptoTool()
+    try:
+        ico_bytes = base64.b64decode(ICO_BASE64.strip())
+        ico_stream = io.BytesIO(ico_bytes)
+        ico_image = Image.open(ico_stream)
+        app_icon = ImageTk.PhotoImage(ico_image)
+        app.iconphoto(True, app_icon)
+        try:
+            app.iconbitmap(default=app_icon)
+        except Exception:
+            pass
+    except Exception as e:
+        messagebox.showerror(title="错误", message=f"Error {e}")
+
+    app.mainloop()
