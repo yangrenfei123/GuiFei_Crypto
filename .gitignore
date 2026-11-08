@@ -1,0 +1,23 @@
+# 编译产物
+bin/
+obj/
+dist/
+_installer_tmp*/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 打包产物
+*.payload.zip
+
+# 系统文件
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# 日志
+*.log
